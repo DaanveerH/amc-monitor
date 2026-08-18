@@ -1417,6 +1417,64 @@ def test_far_future_selectable_dates_within_horizon_floor_are_discovered(
     assert far.isoformat() in discovery_dates
 
 
+def test_showtime_beyond_horizon_stays_active_inside_movie_window(
+    database: Database,
+) -> None:
+    # A movie with an explicit not_before/not_after window (an event booking such
+    # as a December premiere put on sale in August) sits far outside the rolling
+    # horizon. Discovery accepts it, so the retirement pass must accept it too;
+    # otherwise the showtime is deactivated before its seats are ever polled.
+    ids = seed_monitor(database)
+    repository = SqlAlchemyWorkerRepository(database)
+    now = utc_now()
+    far_start = now + timedelta(days=120)
+    with transaction(database.session_factory) as session:
+        movie = session.scalar(select(Movie).where(Movie.slug == "example-feature"))
+        movie.metadata_json = {
+            "not_before": (far_start.date() - timedelta(days=1)).isoformat(),
+            "not_after": (far_start.date() + timedelta(days=24)).isoformat(),
+        }
+        subscription = session.get(Subscription, ids["subscription_id"])
+        subscription.weekday_start = time(0)
+        subscription.weekday_end = time(23, 59, 59)
+        subscription.weekend_start = time(0)
+        subscription.weekend_end = time(23, 59, 59)
+        seeded = session.get(Showtime, ids["showtime_id"])
+        session.add(
+            Showtime(
+                amc_showtime_id="far-future-1",
+                movie_id=movie.id,
+                theatre_id=seeded.theatre_id,
+                format_id=seeded.format_id,
+                starts_at=far_start,
+                active=True,
+                next_status_poll_at=now,
+            )
+        )
+
+    repository.due_resources(now, WorkerPolicy())  # runs the retirement pass
+
+    with transaction(database.session_factory) as session:
+        row = session.scalar(
+            select(Showtime).where(Showtime.amc_showtime_id == "far-future-1")
+        )
+        assert row.active is True
+
+    # Outside the movie window the horizon still retires the showtime.
+    with transaction(database.session_factory) as session:
+        session.scalar(
+            select(Movie).where(Movie.slug == "example-feature")
+        ).metadata_json = {"not_after": (now.date() + timedelta(days=3)).isoformat()}
+
+    repository.due_resources(utc_now(), WorkerPolicy())
+
+    with transaction(database.session_factory) as session:
+        row = session.scalar(
+            select(Showtime).where(Showtime.amc_showtime_id == "far-future-1")
+        )
+        assert row.active is False
+
+
 def test_horizon_sweep_targets_dates_absent_from_selectabledates(
     database: Database,
 ) -> None:

@@ -447,6 +447,28 @@ class SqlAlchemyWorkerRepository:
             return start
 
     @staticmethod
+    def _movie_window(
+        movie: Movie, today: date, fallback_days: int
+    ) -> tuple[date, date]:
+        """Resolve the date range a movie may be polled and alerted for.
+
+        ``not_before``/``not_after`` come from the movie catalog and take
+        precedence over the rolling horizon, so a far-future release keeps its
+        own window. A missing or malformed bound falls back to the horizon.
+        """
+
+        metadata = dict(movie.metadata_json or {})
+        try:
+            lower = date.fromisoformat(str(metadata.get("not_before")))
+        except ValueError:
+            lower = today
+        try:
+            upper = date.fromisoformat(str(metadata.get("not_after")))
+        except ValueError:
+            upper = today + timedelta(days=fallback_days)
+        return max(today, lower), upper
+
+    @staticmethod
     def _in_window(subscription: Subscription, local: datetime) -> bool:
         weekend = local.weekday() >= 5
         start = subscription.weekend_start if weekend else subscription.weekday_start
@@ -1106,9 +1128,10 @@ class SqlAlchemyWorkerRepository:
                 )
             )
             eligible_ids: set[uuid.UUID] = set()
-            for showtime, subscription, theatre in session.execute(
-                select(Showtime, Subscription, Theatre)
+            for showtime, subscription, theatre, movie in session.execute(
+                select(Showtime, Subscription, Theatre, Movie)
                 .select_from(Showtime)
+                .join(Movie, Movie.id == Showtime.movie_id)
                 .join(
                     SubscriptionMovie,
                     SubscriptionMovie.movie_id == Showtime.movie_id,
@@ -1144,10 +1167,17 @@ class SqlAlchemyWorkerRepository:
             ):
                 local = self._local_start(showtime, theatre)
                 local_today = as_utc(now).astimezone(local.tzinfo).date()
-                if (
-                    local_today <= local.date() <= local_today + timedelta(days=max(subscription.days_ahead, HORIZON_DAYS))
-                    and self._in_window(subscription, local)
-                ):
+                # A movie window (not_before/not_after) overrides the rolling
+                # horizon exactly as it does for discovery and alert matching. A
+                # far-future event booking (e.g. a December premiere sold in
+                # August) must stay active, or it is discovered and then retired
+                # before its seats are ever polled.
+                lower, upper = self._movie_window(
+                    movie,
+                    local_today,
+                    max(subscription.days_ahead, HORIZON_DAYS),
+                )
+                if lower <= local.date() <= upper and self._in_window(subscription, local):
                     eligible_ids.add(showtime.id)
             for orphan in active_showtimes:
                 if orphan.id not in eligible_ids:
